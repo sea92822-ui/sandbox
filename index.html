@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sandbox</title>
-<script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.1/simplepeer.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -2060,37 +2059,32 @@ function gameLoop(timestamp) {
   requestAnimationFrame(gameLoop);
 }
 
-// ----- Multiplayer (simple-peer + URL exchange) -----
-let mpPeer = null;
-let mpRole = null; // 'host' or 'join'
-let mpConnected = false;
-let friendCursor = null;
-let friendCursorTimer = 0;
-const mpStatus = document.getElementById('mp-status');
-const mpLinkInput = document.getElementById('mp-link-input');
-const mpConnectBtn = document.getElementById('mp-connect-btn');
-const mpCopyBtn = document.getElementById('mp-copy-btn');
+// ----- Multiplayer (native WebRTC, no libraries) -----
+var mpPC = null;         // RTCPeerConnection
+var mpDC = null;         // RTCDataChannel
+var mpRole = null;       // 'host' or 'join'
+var mpConnected = false;
+var mpMakingOffer = false;
+var friendCursor = null;
+var friendCursorTimer = 0;
+var mpStatus = document.getElementById('mp-status');
+var mpLinkInput = document.getElementById('mp-link-input');
+var mpConnectBtn = document.getElementById('mp-connect-btn');
+var mpCopyBtn = document.getElementById('mp-copy-btn');
+var mpLocalSignal = null; // store our offer/answer for localStorage
+var ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
 
 function mpLog(msg, color) {
   mpStatus.textContent = msg;
   if (color) mpStatus.style.color = color;
 }
 
-// Signal encoding — base64 + encodeURIComponent, works everywhere
 function sigEncode(obj) {
   var json = JSON.stringify(obj);
-  var encoded = encodeURIComponent(json);
-  return btoa(encoded);
+  return btoa(encodeURIComponent(json));
 }
 function sigDecode(str) {
-  try {
-    var decoded = atob(str);
-    var json = decodeURIComponent(decoded);
-    return JSON.parse(json);
-  } catch(e) {
-    mpLog('Decode error: ' + e.message, '#f44');
-    throw e;
-  }
+  return JSON.parse(decodeURIComponent(atob(str)));
 }
 
 function getGridData() {
@@ -2108,7 +2102,6 @@ function getGridData() {
   }
   return data;
 }
-
 function loadGridData(data) {
   for (var i = 0; i < data.length; i++) {
     var d = data[i];
@@ -2124,82 +2117,184 @@ function loadGridData(data) {
     }
   }
 }
-
 function sendMP(msg) {
-  if (mpPeer && mpPeer.connected) {
-    try { mpPeer.send(JSON.stringify(msg)); } catch(e) { console.error(e); }
+  if (mpDC && mpDC.readyState === 'open') {
+    try { mpDC.send(JSON.stringify(msg)); } catch(e) { console.error(e); }
   }
 }
-
 function mpCleanup() {
-  if (mpPeer) { try { mpPeer.destroy(); } catch(e) {} mpPeer = null; }
-  mpRole = null; mpConnected = false; friendCursor = null;
+  if (mpDC) { try { mpDC.close(); } catch(e) {} mpDC = null; }
+  if (mpPC) { try { mpPC.close(); } catch(e) {} mpPC = null; }
+  mpRole = null; mpConnected = false; friendCursor = null; mpLocalSignal = null;
 }
 
-function makeMP(isInitiator, signalData) {
-  if (mpPeer) mpCleanup();
-  mpLog(isInitiator ? 'Generating signal...' : 'Processing signal...', '#aa8');
+// Create a peer connection and start offer/answer
+function createPC(isInitiator, remoteSignal) {
+  if (mpPC) mpCleanup();
+  mpLog(isInitiator ? 'Creating offer...' : 'Creating answer...', '#aa8');
+
   try {
-    mpPeer = new SimplePeer({ initiator: isInitiator, trickle: false,
-      config: { iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-      ]}
-    });
+    mpPC = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   } catch(e) {
-    mpLog('WebRTC error: ' + e.message, '#f44');
-    console.error(e);
-    return;
+    mpLog('WebRTC not supported: ' + e.message, '#f44');
+    return null;
   }
-  mpPeer.on('signal', function(data) {
-    try {
-      var compressed = sigEncode(data);
-      if (isInitiator) {
-        var url = location.origin + location.pathname + '#s=' + compressed;
-        location.hash = 's=' + compressed;
-        mpLog('Send this link to your friend!', '#4f4');
-        mpLinkInput.value = url;
-        mpLinkInput.style.display = 'block';
-        mpCopyBtn.style.display = 'block';
-        try { navigator.clipboard.writeText(url); } catch(e) {}
-      } else {
-        var url = location.origin + location.pathname + '#a=' + compressed;
-        location.hash = 'a=' + compressed;
-        mpLog('Send this link BACK to the host!', '#4f4');
-        mpLinkInput.value = url;
-        mpLinkInput.style.display = 'block';
-        mpCopyBtn.style.display = 'block';
-        try { navigator.clipboard.writeText(url); } catch(e) {}
-      }
-    } catch(e) {
-      mpLog('Signal encode error: ' + e.message, '#f44');
-      console.error(e);
+
+  // Data channel
+  if (isInitiator) {
+    mpDC = mpPC.createDataChannel('sandbox', { ordered: true });
+    mpDC.onopen = onConnected;
+    mpDC.onmessage = onData;
+    mpDC.onclose = onDisconnect;
+  } else {
+    mpPC.ondatachannel = function(e) {
+      mpDC = e.channel;
+      mpDC.onopen = onConnected;
+      mpDC.onmessage = onData;
+      mpDC.onclose = onDisconnect;
+    };
+  }
+
+  // When remote signal arrives, set it after we create our offer/answer
+  var remoteReceived = false;
+  var ourSignalReady = null; // function to call when our signal is ready
+
+  // Gather ICE candidates and emit final signal when done
+  var candidates = [];
+  var gatheringComplete = false;
+  var localDescSet = false;
+
+  function emitSignal() {
+    if (!localDescSet) return;
+    if (!gatheringComplete) return;
+    var signal = { type: mpPC.localDescription.type, sdp: mpPC.localDescription.sdp, candidates: candidates };
+    mpLocalSignal = signal;
+    var compressed = sigEncode(signal);
+    if (isInitiator) {
+      localStorage.setItem('mp_offer', compressed);
+      var url = location.origin + location.pathname + '#s=' + compressed;
+      location.hash = 's=' + compressed;
+      mpLog('Send this link to your friend!', '#4f4');
+      mpLinkInput.value = url;
+      mpLinkInput.style.display = 'block';
+      mpCopyBtn.style.display = 'block';
+      try { navigator.clipboard.writeText(url); } catch(e) {}
+    } else {
+      var url = location.origin + location.pathname + '#a=' + compressed;
+      location.hash = 'a=' + compressed;
+      mpLog('Send this link BACK to the host!', '#4f4');
+      mpLinkInput.value = url;
+      mpLinkInput.style.display = 'block';
+      mpCopyBtn.style.display = 'block';
+      try { navigator.clipboard.writeText(url); } catch(e) {}
     }
-  });
-  mpPeer.on('connect', function() {
+    // If remote signal was already received, process it
+    if (remoteSignal && !remoteReceived) {
+      remoteReceived = true;
+      processRemote(remoteSignal);
+    }
+  }
+
+  mpPC.onicecandidate = function(e) {
+    if (e.candidate) {
+      candidates.push(e.candidate.candidate);
+    } else {
+      gatheringComplete = true;
+      emitSignal();
+    }
+  };
+
+  mpPC.oniceconnectionstatechange = function() {
+    if (mpPC.iceConnectionState === 'failed' || mpPC.iceConnectionState === 'disconnected') {
+      mpLog('Connection ' + mpPC.iceConnectionState, '#f44');
+    }
+  };
+
+  // Timeout for ICE gathering (5s)
+  var iceTimer = setTimeout(function() {
+    if (!gatheringComplete) {
+      gatheringComplete = true;
+      emitSignal();
+    }
+  }, 5000);
+
+  // Create offer or answer
+  if (isInitiator) {
+    mpPC.createOffer().then(function(offer) {
+      return mpPC.setLocalDescription(offer);
+    }).then(function() {
+      localDescSet = true;
+      emitSignal();
+    }).catch(function(e) {
+      mpLog('Offer error: ' + e.message, '#f44');
+    });
+  } else {
+    // For non-initiator, we need remote signal first
+    if (remoteSignal) {
+      processRemote(remoteSignal);
+    }
+  }
+
+  function processRemote(signal) {
+    // Set remote description and create answer
+    var desc = new RTCSessionDescription({ type: signal.type, sdp: signal.sdp });
+    mpPC.setRemoteDescription(desc).then(function() {
+      return mpPC.createAnswer();
+    }).then(function(answer) {
+      return mpPC.setLocalDescription(answer);
+    }).then(function() {
+      localDescSet = true;
+      emitSignal();
+    }).catch(function(e) {
+      mpLog('Answer error: ' + e.message, '#f44');
+    });
+  }
+
+  // If remote signal was provided as argument, process it
+  if (remoteSignal) {
+    processRemote(remoteSignal);
+  }
+
+  function onConnected() {
     mpConnected = true;
     mpLog('Connected!', '#4f4');
     mpLinkInput.style.display = 'none';
     mpCopyBtn.style.display = 'none';
     mpConnectBtn.style.display = 'none';
     if (mpRole === 'host') {
-      setTimeout(function() { sendMP({ type: 'sync', data: getGridData() }); }, 100);
+      setTimeout(function() { sendMP({ type: 'sync', data: getGridData() }); }, 200);
     }
-  });
-  mpPeer.on('data', function(raw) {
+  }
+  function onData(e) {
     try {
-      var d = JSON.parse(raw);
+      var d = JSON.parse(e.data);
       if (d.type === 'sync' && mpRole === 'join') { loadGridData(d.data); mpLog('World loaded!', '#4f4'); return; }
       if (d.type === 'place') { spawnBrushAt(d.mx, d.my, d.element); return; }
       if (d.type === 'cursor') { friendCursor = { x: d.mx, y: d.my }; friendCursorTimer = 60; return; }
     } catch(e) { console.error(e); }
-  });
-  mpPeer.on('error', function(e) { mpLog('WebRTC: ' + (e.message||e), '#f44'); console.error(e); });
-  mpPeer.on('close', function() { if (mpConnected) { mpLog('Disconnected', '#644'); mpConnected = false; } });
-  if (signalData) {
-    try { mpPeer.signal(signalData); } catch(e) { mpLog('Signal error: ' + e.message, '#f44'); console.error(e); }
   }
-  return mpPeer;
+  function onDisconnect() {
+    if (mpConnected) { mpLog('Disconnected', '#644'); mpConnected = false; }
+  }
+
+  return mpPC;
+}
+
+// Process remote signal and feed it to existing PC
+function feedRemote(signal) {
+  if (!mpPC) return;
+  var desc = new RTCSessionDescription({ type: signal.type, sdp: signal.sdp });
+  mpPC.setRemoteDescription(desc).catch(function(e) {
+    mpLog('Signal error: ' + e.message, '#f44');
+  });
+  // Add ICE candidates
+  if (signal.candidates) {
+    for (var i = 0; i < signal.candidates.length; i++) {
+      try {
+        mpPC.addIceCandidate(new RTCIceCandidate({ candidate: signal.candidates[i] }));
+      } catch(e) {}
+    }
+  }
 }
 
 // Host button
@@ -2209,7 +2304,7 @@ document.getElementById('host-btn').addEventListener('click', function() {
   mpLinkInput.value = ''; mpLinkInput.style.display = 'none';
   mpCopyBtn.style.display = 'none';
   mpConnectBtn.style.display = 'block';
-  makeMP(true, null);
+  createPC(true, null);
 });
 
 // Join button
@@ -2223,48 +2318,41 @@ document.getElementById('join-btn').addEventListener('click', function() {
       mpLinkInput.style.display = 'none';
       mpCopyBtn.style.display = 'none';
       mpConnectBtn.style.display = 'none';
-      makeMP(false, signal);
+      createPC(false, signal);
     } catch(e) {
-      mpLog('Failed to parse link: ' + e.message, '#f44');
-      console.error(e);
+      mpLog('Parse error: ' + e.message, '#f44');
     }
   } else if (hash.indexOf('#a=') === 0) {
-    // This is an answer URL being opened (host's page reloaded?)
-    // Try to reconstruct with stored offer
+    // Answer URL - try to reconstruct with stored offer
     var stored = localStorage.getItem('mp_offer');
     if (stored) {
       try {
+        var offerSignal = sigDecode(stored);
         var raw = hash.slice(3);
-        var answer = sigDecode(raw);
-        var offer = JSON.parse(stored);
+        var answerSignal = sigDecode(raw);
         mpRole = 'host';
         mpLinkInput.style.display = 'none';
         mpCopyBtn.style.display = 'none';
         mpConnectBtn.style.display = 'none';
-        makeMP(true, offer);  // recreate with stored offer
-        // After a short delay, feed the answer
+        createPC(true, offerSignal); // recreate with stored offer
         setTimeout(function() {
-          if (mpPeer) {
-            try { mpPeer.signal(answer); } catch(e) { mpLog('Signal error: ' + e.message, '#f44'); }
-          }
-        }, 500);
-      } catch(e) {
-        mpLog('Reconnect failed: ' + e.message, '#f44');
-      }
+          if (mpPC) feedRemote(answerSignal);
+        }, 3000); // wait for PC to be ready
+      } catch(e) { mpLog('Reconnect error: ' + e.message, '#f44'); }
     } else {
-      mpLog('No stored offer found. Use Connect button.', '#aa8');
+      mpLog('Paste answer link in field & click Connect', '#aa8');
       mpLinkInput.value = location.href;
       mpLinkInput.style.display = 'block';
       mpConnectBtn.style.display = 'block';
     }
   } else {
-    mpLog('Open the link from host first, then click Join', '#aa8');
+    mpLog('Open host link first, then click Join', '#aa8');
     mpLinkInput.value = ''; mpLinkInput.style.display = 'block';
     mpConnectBtn.style.display = 'block';
   }
 });
 
-// Connect button — paste answer link here
+// Connect button
 mpConnectBtn.addEventListener('click', function() {
   var input = mpLinkInput.value.trim();
   if (!input) return;
@@ -2274,21 +2362,21 @@ mpConnectBtn.addEventListener('click', function() {
     var compressed = '';
     if (hash.indexOf('#a=') === 0) compressed = hash.slice(3);
     else if (hash.indexOf('#s=') === 0) compressed = hash.slice(3);
-    else { mpLog('Link must contain #a= or #s=', '#f44'); return; }
+    else { mpLog('Link must have #a= or #s=', '#f44'); return; }
     var signal = sigDecode(compressed);
-    if (mpRole === 'host' && mpPeer) {
-      mpPeer.signal(signal);
+    if (mpRole === 'host' && mpPC) {
+      feedRemote(signal);
       mpLog('Answer applied!', '#4f4');
     } else if (hash.indexOf('#s=') === 0) {
       mpRole = 'join';
-      makeMP(false, signal);
+      if (mpPC) feedRemote(signal);
+      else createPC(false, signal);
     } else {
       mpLog('Click Host first, then paste answer', '#f44');
     }
     mpLinkInput.value = '';
   } catch(e) {
     mpLog('Invalid link: ' + e.message, '#f44');
-    console.error(e);
   }
 });
 
@@ -2297,22 +2385,22 @@ mpCopyBtn.addEventListener('click', function() {
   if (val) { navigator.clipboard.writeText(val); mpLog('Copied!', '#8cf'); }
 });
 
-// Auto-detect signal on load
+// Auto-detect on load
 (function() {
   var hash = location.hash;
   if (hash.indexOf('#s=') === 0) {
-    mpLog('Link with offer detected. Click Join.', '#aa8');
+    mpLog('Link detected. Click Join.', '#aa8');
     mpLinkInput.value = location.href;
     mpLinkInput.style.display = 'block';
   } else if (hash.indexOf('#a=') === 0) {
     mpLog('Answer link detected. Click Join or Connect.', '#aa8');
     mpLinkInput.value = location.href;
     mpLinkInput.style.display = 'block';
-    // Try auto-reconnect with stored offer
+    mpConnectBtn.style.display = 'block';
     var stored = localStorage.getItem('mp_offer');
     if (stored) {
       mpLog('Found stored offer, reconnecting...', '#aa8');
-      document.getElementById('join-btn').click();
+      setTimeout(function() { document.getElementById('join-btn').click(); }, 500);
     }
   }
 })();
