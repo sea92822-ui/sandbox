@@ -2100,7 +2100,18 @@ function onMPData(raw) {
 
 function makeMP(isInitiator, signalData) {
   if (mpPeer) { try { mpPeer.destroy(); } catch(e) {} }
-  mpPeer = new SimplePeer({ initiator: isInitiator, trickle: false });
+  mpPeer = new SimplePeer({
+    initiator: isInitiator,
+    trickle: false,
+    config: {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun.voipbuster.com:3478' },
+      ]
+    }
+  });
   mpPeer.on('signal', (data) => {
     mpSignalOut.value = JSON.stringify(data);
     mpSignalOut.select();
@@ -2116,7 +2127,7 @@ function makeMP(isInitiator, signalData) {
     if (mpRole === 'host') sendMP({ type: 'sync', data: getGridData() });
   });
   mpPeer.on('data', onMPData);
-  mpPeer.on('error', (err) => { mpStatus.textContent = 'Error'; console.error(err); });
+  mpPeer.on('error', (err) => { mpStatus.textContent = 'Error: ' + (err.message || err.code || 'unknown'); mpStatus.style.color = '#f44'; console.error(err); });
   mpPeer.on('close', () => { mpStatus.textContent = 'Disconnected'; mpStatus.style.color = '#644'; mpConn = null; });
   if (signalData) mpPeer.signal(signalData);
   return mpPeer;
