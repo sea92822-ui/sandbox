@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sandbox</title>
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.3.2/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.1/simplepeer.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -302,11 +303,6 @@
       <span class="color-dot" style="background:#4488ff;box-shadow:0 0 8px rgba(68,136,255,0.4)"></span> Join
     </button>
     <div id="mp-status" style="font-size:10px;color:#666;text-align:center;margin-top:2px">offline</div>
-    <div id="mp-signal" style="display:none;margin-top:4px">
-      <textarea id="mp-signal-out" rows="2" style="width:100%;background:#111;color:#8cf;border:1px solid #333;border-radius:4px;font-size:10px;padding:4px;resize:none" readonly onclick="this.select();navigator.clipboard?.writeText(this.value)"></textarea>
-      <textarea id="mp-signal-in" rows="2" placeholder="Paste signal here..." style="width:100%;background:#111;color:#8cf;border:1px solid #333;border-radius:4px;font-size:10px;padding:4px;resize:none;margin-top:2px"></textarea>
-      <button id="mp-signal-btn" style="width:100%;padding:4px;background:#1a1a3a;border:1px solid #444;border-radius:4px;color:#8cf;font-size:11px;cursor:pointer;margin-top:2px">Send Signal</button>
-    </div>
   </div>
 
   <button id="pause-btn" style="padding:8px;background:#1a1a2a;border:1px solid #442266;border-radius:6px;color:#aa88dd;font-size:13px;cursor:pointer;text-transform:uppercase;letter-spacing:1px;margin-top:4px;transition:all 0.2s;">Pause (Space)</button>
@@ -2043,12 +2039,17 @@ function gameLoop(timestamp) {
   requestAnimationFrame(gameLoop);
 }
 
-// ----- Multiplayer (PeerJS using WebSocket, no CORS) -----
-let peer = null;
-let conn = null;
-let peerId = null;
-let isHost = false;
+// ----- Multiplayer (MQTT signaling + simple-peer WebRTC) -----
+let mq = null;
+let sp = null;
+let roomCode = '';
 const mpStatus = document.getElementById('mp-status');
+const MQTT_URL = 'wss://broker.hivemq.com:8000/mqtt';
+
+function mpLog(msg, color) {
+  mpStatus.textContent = msg;
+  if (color) mpStatus.style.color = color;
+}
 
 function getGridData() {
   const data = [];
@@ -2081,74 +2082,109 @@ function loadGridData(data) {
   }
 }
 
+function mpCleanup() {
+  if (sp) { try { sp.destroy(); } catch(e) {} sp = null; }
+  if (mq) { try { mq.end(true); } catch(e) {} mq = null; }
+}
+
+function sendMP(msg) {
+  if (sp && sp.connected) {
+    try { sp.send(JSON.stringify({ type: 'place', ...msg })); } catch(e) {}
+  }
+}
+
 document.getElementById('host-btn').addEventListener('click', () => {
-  if (peer) { peer.destroy(); peer = null; }
-  mpStatus.textContent = 'Connecting...';
-  mpStatus.style.color = '#aa8';
-  isHost = true;
-  peer = new Peer({ key: 'peerjs', debug: 0 });
-  peer.on('open', (id) => {
-    peerId = id;
-    mpStatus.textContent = 'Your code: ' + id;
-    mpStatus.style.color = '#4f4';
-    document.getElementById('mp-signal-out').value = id;
-    document.getElementById('mp-signal-out').style.display = 'block';
-    try { navigator.clipboard.writeText(id); } catch(e) {}
+  mpCleanup();
+  roomCode = '';
+  mpLog('Connecting...', '#aa8');
+
+  mq = mqtt.connect(MQTT_URL, { connectTimeout: 8000 });
+  mq.on('connect', () => {
+    const code = Math.random().toString(36).slice(2, 7).toUpperCase();
+    roomCode = code;
+    const hostTopic = 'sb/' + code + '/host';
+    const clientTopic = 'sb/' + code + '/client';
+    mq.subscribe(hostTopic);
+    mpLog('Room: ' + code, '#4f4');
+    try { navigator.clipboard.writeText(code); } catch(e) {}
   });
-  peer.on('connection', (c) => {
-    conn = c;
-    mpStatus.textContent = 'Friend joined!';
-    conn.on('open', () => {
-      mpStatus.textContent = 'Connected!';
-      mpStatus.style.color = '#4f4';
-      document.getElementById('mp-signal-out').style.display = 'none';
-      conn.send(JSON.stringify({ type: 'sync', data: getGridData() }));
-      document.getElementById('mp-signal-out').value = '';
-    });
-    conn.on('data', (raw) => {
-      try {
-        const msg = JSON.parse(raw);
-        if (msg.type === 'place') { spawnBrushAt(msg.mx, msg.my, msg.element); }
-      } catch(e) {}
-    });
-    conn.on('close', () => { mpStatus.textContent = 'Disconnected'; mpStatus.style.color = '#644'; conn = null; });
+
+  mq.on('message', (topic, payload) => {
+    const msg = JSON.parse(payload.toString());
+    if (msg.type === 'ready') {
+      mpLog('Friend joined, handshake...', '#aa8');
+      sp = new SimplePeer({ initiator: true, trickle: false });
+      sp.on('signal', (signal) => {
+        mq.publish('sb/' + roomCode + '/client', JSON.stringify({ type: 'offer', signal: signal }));
+      });
+      sp.on('connect', () => {
+        mpLog('Connected!', '#4f4');
+        mq.end(true);
+        mq = null;
+        sendMP({ type: 'sync', data: getGridData() });
+      });
+      sp.on('data', (raw) => {
+        try {
+          const d = JSON.parse(raw);
+          if (d.type === 'place') { spawnBrushAt(d.mx, d.my, d.element); }
+        } catch(e) {}
+      });
+      sp.on('error', (e) => { mpLog('Error: ' + (e.message||e), '#f44'); console.error(e); });
+      sp.on('close', () => { mpLog('Disconnected', '#644'); sp = null; });
+    }
+    if (msg.type === 'answer') {
+      if (sp) sp.signal(msg.signal);
+    }
   });
-  peer.on('error', (err) => {
-    mpStatus.textContent = 'Error: ' + err.message;
-    mpStatus.style.color = '#f44';
-    console.error(err);
-  });
-  peer.on('disconnected', () => { mpStatus.textContent = 'Disconnected from server'; mpStatus.style.color = '#644'; });
+
+  mq.on('error', (e) => { mpLog('MQ error: ' + (e.message||e), '#f44'); });
+  mq.on('close', () => { if (mq) { mpLog('Disconnected from server', '#644'); } });
 });
 
 document.getElementById('join-btn').addEventListener('click', () => {
-  const id = prompt('Enter host code:');
-  if (!id || !id.trim()) return;
-  isHost = false;
-  if (peer) { peer.destroy(); peer = null; }
-  mpStatus.textContent = 'Connecting...';
-  mpStatus.style.color = '#aa8';
-  peer = new Peer({ key: 'peerjs', debug: 0 });
-  peer.on('open', () => {
-    conn = peer.connect(id.trim());
-    conn.on('open', () => {
-      mpStatus.textContent = 'Connected!';
-      mpStatus.style.color = '#4f4';
-    });
-    conn.on('data', (raw) => {
-      try {
-        const msg = JSON.parse(raw);
-        if (msg.type === 'sync') { loadGridData(msg.data); return; }
-        if (msg.type === 'place') { spawnBrushAt(msg.mx, msg.my, msg.element); }
-      } catch(e) {}
-    });
-    conn.on('close', () => { mpStatus.textContent = 'Disconnected'; mpStatus.style.color = '#644'; conn = null; });
-    conn.on('error', (err) => { mpStatus.textContent = 'Conn error: ' + err; });
+  const code = prompt('Enter room code:');
+  if (!code || !code.trim()) return;
+  mpCleanup();
+  roomCode = code.trim().toUpperCase();
+  mpLog('Joining...', '#aa8');
+
+  mq = mqtt.connect(MQTT_URL, { connectTimeout: 8000 });
+  mq.on('connect', () => {
+    const hostTopic = 'sb/' + roomCode + '/host';
+    const clientTopic = 'sb/' + roomCode + '/client';
+    mq.subscribe(clientTopic);
+    mq.publish(hostTopic, JSON.stringify({ type: 'ready' }));
   });
-  peer.on('error', (err) => { mpStatus.textContent = 'Error: ' + err.message; mpStatus.style.color = '#f44'; console.error(err); });
+
+  mq.on('message', (topic, payload) => {
+    const msg = JSON.parse(payload.toString());
+    if (msg.type === 'offer') {
+      sp = new SimplePeer({ initiator: false, trickle: false });
+      sp.signal(msg.signal);
+      sp.on('signal', (signal) => {
+        mq.publish('sb/' + roomCode + '/host', JSON.stringify({ type: 'answer', signal: signal }));
+      });
+      sp.on('connect', () => {
+        mpLog('Connected!', '#4f4');
+        mq.end(true);
+        mq = null;
+      });
+      sp.on('data', (raw) => {
+        try {
+          const d = JSON.parse(raw);
+          if (d.type === 'sync') { loadGridData(d.data); return; }
+          if (d.type === 'place') { spawnBrushAt(d.mx, d.my, d.element); }
+        } catch(e) {}
+      });
+      sp.on('error', (e) => { mpLog('Error: ' + (e.message||e), '#f44'); });
+      sp.on('close', () => { mpLog('Disconnected', '#644'); sp = null; });
+    }
+  });
+
+  mq.on('error', (e) => { mpLog('MQ error: ' + (e.message||e), '#f44'); });
+  mq.on('close', () => { if (mq) { mpLog('Disconnected from server', '#644'); } });
 });
 
-// Intercept placeAtMouse to sync
 placeAtMouse = function(mx, my) {
   const cx = Math.floor(mx), cy = Math.floor(my);
   if (selectedElement === 'switch') {
@@ -2158,12 +2194,6 @@ placeAtMouse = function(mx, my) {
   spawnBrushAt(mx, my, selectedElement);
   sendMP({ mx, my, element: selectedElement });
 };
-
-function sendMP(msg) {
-  if (conn && conn.open) {
-    try { conn.send(JSON.stringify({ type: 'place', ...msg })); } catch(e) {}
-  }
-}
 
 // Pause controls
 document.getElementById('pause-btn').addEventListener('click', () => {
