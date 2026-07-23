@@ -4,8 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sandbox</title>
-<script src="https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.1/simplepeer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lz-string@1.5.0/libs/lz-string.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -302,7 +302,10 @@
     <button id="join-btn" class="tool-btn" style="--glow:#4488ff;border-color:#224488">
       <span class="color-dot" style="background:#4488ff;box-shadow:0 0 8px rgba(68,136,255,0.4)"></span> Join
     </button>
-    <div id="mp-status" style="font-size:10px;color:#666;text-align:center;margin-top:2px">offline</div>
+    <input id="mp-link-input" type="text" placeholder="Paste link here..." style="width:100%;background:#111;color:#8cf;border:1px solid #333;border-radius:4px;font-size:10px;padding:4px;outline:none">
+    <button id="mp-connect-btn" style="width:100%;padding:4px;background:#1a1a3a;border:1px solid #444;border-radius:4px;color:#8cf;font-size:11px;cursor:pointer">Connect</button>
+    <div id="mp-status" style="font-size:10px;color:#666;text-align:center;margin-top:2px;word-break:break-all">Offline</div>
+    <button id="mp-copy-btn" style="width:100%;padding:4px;background:#1a1a2a;border:1px solid #444;border-radius:4px;color:#8cf;font-size:10px;cursor:pointer;display:none">Copy Link</button>
   </div>
 
   <button id="pause-btn" style="padding:8px;background:#1a1a2a;border:1px solid #442266;border-radius:6px;color:#aa88dd;font-size:13px;cursor:pointer;text-transform:uppercase;letter-spacing:1px;margin-top:4px;transition:all 0.2s;">Pause (Space)</button>
@@ -854,6 +857,24 @@ function render() {
     ctx.restore();
     explosionFlash.timer--;
   }
+
+  // Friend cursor
+  if (friendCursor) {
+    friendCursorTimer--;
+    if (friendCursorTimer <= 0) { friendCursor = null; }
+    else {
+      const alpha = Math.min(1, friendCursorTimer / 30) * 0.8;
+      ctx.save();
+      ctx.strokeStyle = `rgba(255,200,100,${alpha})`;
+      ctx.lineWidth = 2;
+      ctx.shadowColor = 'rgba(255,200,100,0.5)';
+      ctx.shadowBlur = 6;
+      ctx.strokeRect(friendCursor.x - 2, friendCursor.y - 2, 4, 4);
+      ctx.fillStyle = `rgba(255,200,100,${alpha * 0.3})`;
+      ctx.fillRect(friendCursor.x - 3, friendCursor.y - 3, 6, 6);
+      ctx.restore();
+    }
+  }
 }
 
 // ----- Element Spawning -----
@@ -947,6 +968,7 @@ canvas.addEventListener('mousemove', (e) => {
   if (isMouseDown) {
     const { mx, my } = canvasCoords(e);
     placeAtMouse(mx, my);
+    sendMP({ type: 'cursor', mx, my });
   }
 });
 canvas.addEventListener('mouseup',   () => { isMouseDown = false; });
@@ -2039,12 +2061,16 @@ function gameLoop(timestamp) {
   requestAnimationFrame(gameLoop);
 }
 
-// ----- Multiplayer (MQTT signaling + simple-peer WebRTC) -----
-let mq = null;
-let sp = null;
-let roomCode = '';
+// ----- Multiplayer (simple-peer + lz-string URL exchange) -----
+let mpPeer = null;
+let mpRole = null; // 'host' or 'join'
+let mpConnected = false;
+let friendCursor = null;
+let friendCursorTimer = 0;
 const mpStatus = document.getElementById('mp-status');
-const MQTT_URL = 'wss://broker.hivemq.com:8000/mqtt';
+const mpLinkInput = document.getElementById('mp-link-input');
+const mpConnectBtn = document.getElementById('mp-connect-btn');
+const mpCopyBtn = document.getElementById('mp-copy-btn');
 
 function mpLog(msg, color) {
   mpStatus.textContent = msg;
@@ -2082,117 +2108,158 @@ function loadGridData(data) {
   }
 }
 
-function mpCleanup() {
-  if (sp) { try { sp.destroy(); } catch(e) {} sp = null; }
-  if (mq) { try { mq.end(true); } catch(e) {} mq = null; }
-}
-
 function sendMP(msg) {
-  if (sp && sp.connected) {
-    try { sp.send(JSON.stringify({ type: 'place', ...msg })); } catch(e) {}
+  if (mpPeer && mpPeer.connected) {
+    try { mpPeer.send(JSON.stringify(msg)); } catch(e) {}
   }
 }
 
+function mpCleanup() {
+  if (mpPeer) { try { mpPeer.destroy(); } catch(e) {} mpPeer = null; }
+  mpRole = null; mpConnected = false; friendCursor = null;
+}
+
+function makeMP(isInitiator, signalData) {
+  if (mpPeer) mpCleanup();
+  mpPeer = new SimplePeer({ initiator: isInitiator, trickle: false,
+    config: { iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' }
+    ]}
+  });
+  mpPeer.on('signal', (data) => {
+    const compressed = LZString.compressToEncodedURIComponent(JSON.stringify(data));
+    if (isInitiator) {
+      const url = location.origin + location.pathname + '#s=' + compressed;
+      location.hash = 's=' + compressed;
+      mpLog('Your link (send to friend):', '#4f4');
+      mpLinkInput.value = url;
+      mpLinkInput.style.display = 'block';
+      mpCopyBtn.style.display = 'block';
+      try { navigator.clipboard.writeText(url); } catch(e) {}
+    } else {
+      const url = location.origin + location.pathname + '#a=' + compressed;
+      location.hash = 'a=' + compressed;
+      mpLog('Send this link back to host:', '#4f4');
+      mpLinkInput.value = url;
+      mpLinkInput.style.display = 'block';
+      mpCopyBtn.style.display = 'block';
+      try { navigator.clipboard.writeText(url); } catch(e) {}
+    }
+  });
+  mpPeer.on('connect', () => {
+    mpConnected = true;
+    mpLog('Connected!', '#4f4');
+    mpLinkInput.style.display = 'none';
+    mpCopyBtn.style.display = 'none';
+    document.getElementById('mp-connect-btn').style.display = 'none';
+    if (mpRole === 'host') sendMP({ type: 'sync', data: getGridData() });
+  });
+  mpPeer.on('data', (raw) => {
+    try {
+      const d = JSON.parse(raw);
+      if (d.type === 'sync' && mpRole === 'join') { loadGridData(d.data); return; }
+      if (d.type === 'place') { spawnBrushAt(d.mx, d.my, d.element); return; }
+      if (d.type === 'cursor') { friendCursor = { x: d.mx, y: d.my }; friendCursorTimer = 60; return; }
+    } catch(e) {}
+  });
+  mpPeer.on('error', (e) => { mpLog('Error: ' + (e.message||e), '#f44'); console.error(e); });
+  mpPeer.on('close', () => { if (!mpConnected) return; mpLog('Disconnected', '#644'); mpConnected = false; });
+  if (signalData) mpPeer.signal(signalData);
+  return mpPeer;
+}
+
+// Host button
 document.getElementById('host-btn').addEventListener('click', () => {
   mpCleanup();
-  roomCode = '';
-  mpLog('Connecting...', '#aa8');
-
-  mq = mqtt.connect(MQTT_URL, { connectTimeout: 8000 });
-  mq.on('connect', () => {
-    const code = Math.random().toString(36).slice(2, 7).toUpperCase();
-    roomCode = code;
-    const hostTopic = 'sb/' + code + '/host';
-    const clientTopic = 'sb/' + code + '/client';
-    mq.subscribe(hostTopic);
-    mpLog('Room: ' + code, '#4f4');
-    try { navigator.clipboard.writeText(code); } catch(e) {}
-  });
-
-  mq.on('message', (topic, payload) => {
-    const msg = JSON.parse(payload.toString());
-    if (msg.type === 'ready') {
-      mpLog('Friend joined, handshake...', '#aa8');
-      sp = new SimplePeer({ initiator: true, trickle: false });
-      sp.on('signal', (signal) => {
-        mq.publish('sb/' + roomCode + '/client', JSON.stringify({ type: 'offer', signal: signal }));
-      });
-      sp.on('connect', () => {
-        mpLog('Connected!', '#4f4');
-        mq.end(true);
-        mq = null;
-        sendMP({ type: 'sync', data: getGridData() });
-      });
-      sp.on('data', (raw) => {
-        try {
-          const d = JSON.parse(raw);
-          if (d.type === 'place') { spawnBrushAt(d.mx, d.my, d.element); }
-        } catch(e) {}
-      });
-      sp.on('error', (e) => { mpLog('Error: ' + (e.message||e), '#f44'); console.error(e); });
-      sp.on('close', () => { mpLog('Disconnected', '#644'); sp = null; });
-    }
-    if (msg.type === 'answer') {
-      if (sp) sp.signal(msg.signal);
-    }
-  });
-
-  mq.on('error', (e) => { mpLog('MQ error: ' + (e.message||e), '#f44'); });
-  mq.on('close', () => { if (mq) { mpLog('Disconnected from server', '#644'); } });
+  mpRole = 'host';
+  mpLog('Generating link...', '#aa8');
+  mpLinkInput.value = ''; mpLinkInput.style.display = 'none';
+  mpCopyBtn.style.display = 'none';
+  document.getElementById('mp-connect-btn').style.display = 'block';
+  makeMP(true, null);
 });
 
+// Join button - check if URL has signal
 document.getElementById('join-btn').addEventListener('click', () => {
-  const code = prompt('Enter room code:');
-  if (!code || !code.trim()) return;
-  mpCleanup();
-  roomCode = code.trim().toUpperCase();
-  mpLog('Joining...', '#aa8');
-
-  mq = mqtt.connect(MQTT_URL, { connectTimeout: 8000 });
-  mq.on('connect', () => {
-    const hostTopic = 'sb/' + roomCode + '/host';
-    const clientTopic = 'sb/' + roomCode + '/client';
-    mq.subscribe(clientTopic);
-    mq.publish(hostTopic, JSON.stringify({ type: 'ready' }));
-  });
-
-  mq.on('message', (topic, payload) => {
-    const msg = JSON.parse(payload.toString());
-    if (msg.type === 'offer') {
-      sp = new SimplePeer({ initiator: false, trickle: false });
-      sp.signal(msg.signal);
-      sp.on('signal', (signal) => {
-        mq.publish('sb/' + roomCode + '/host', JSON.stringify({ type: 'answer', signal: signal }));
-      });
-      sp.on('connect', () => {
-        mpLog('Connected!', '#4f4');
-        mq.end(true);
-        mq = null;
-      });
-      sp.on('data', (raw) => {
-        try {
-          const d = JSON.parse(raw);
-          if (d.type === 'sync') { loadGridData(d.data); return; }
-          if (d.type === 'place') { spawnBrushAt(d.mx, d.my, d.element); }
-        } catch(e) {}
-      });
-      sp.on('error', (e) => { mpLog('Error: ' + (e.message||e), '#f44'); });
-      sp.on('close', () => { mpLog('Disconnected', '#644'); sp = null; });
+  const hash = location.hash;
+  if (hash.startsWith('#s=') || hash.startsWith('#' + encodeURIComponent('s='))) {
+    // Has host signal in URL
+    try {
+      const compressed = decodeURIComponent(hash.replace(/^#s=/, ''));
+      const signal = JSON.parse(LZString.decompressFromEncodedURIComponent(compressed));
+      mpRole = 'join';
+      mpLog('Connecting...', '#aa8');
+      mpLinkInput.style.display = 'none';
+      mpCopyBtn.style.display = 'none';
+      document.getElementById('mp-connect-btn').style.display = 'none';
+      makeMP(false, signal);
+    } catch(e) {
+      mpLog('Invalid link format', '#f44');
     }
-  });
-
-  mq.on('error', (e) => { mpLog('MQ error: ' + (e.message||e), '#f44'); });
-  mq.on('close', () => { if (mq) { mpLog('Disconnected from server', '#644'); } });
+  } else {
+    // No signal - prompt user to paste link
+    mpLog('Paste the host link above, then click Connect', '#aa8');
+    mpLinkInput.value = ''; mpLinkInput.style.display = 'block';
+    document.getElementById('mp-connect-btn').style.display = 'block';
+  }
 });
 
+// Connect button - pasted a link
+mpConnectBtn.addEventListener('click', () => {
+  const input = mpLinkInput.value.trim();
+  if (!input) return;
+  try {
+    const url = new URL(input);
+    const hash = url.hash;
+    let compressed = '';
+    if (hash.startsWith('#s=')) compressed = hash.slice(3);
+    else if (hash.startsWith('#' + encodeURIComponent('s='))) compressed = hash.slice(3);
+    else { mpLog('Invalid link (no signal found)', '#f44'); return; }
+    compressed = decodeURIComponent(compressed);
+    const signal = JSON.parse(LZString.decompressFromEncodedURIComponent(compressed));
+    if (mpRole === 'host') {
+      // Host receiving answer
+      if (mpPeer) mpPeer.signal(signal);
+      mpLog('Processing answer...', '#aa8');
+    } else {
+      mpRole = 'join';
+      makeMP(false, signal);
+    }
+    mpLinkInput.value = '';
+  } catch(e) {
+    mpLog('Invalid link: ' + e.message, '#f44');
+  }
+});
+
+mpCopyBtn.addEventListener('click', () => {
+  const val = mpLinkInput.value;
+  if (val) { navigator.clipboard.writeText(val); mpLog('Copied!', '#8cf'); }
+});
+
+// Auto-detect signal on page load
+(function() {
+  const hash = location.hash;
+  if (hash.startsWith('#s=') || hash.startsWith('#a=')) {
+    const prefix = hash.startsWith('#s=') ? 's' : 'a';
+    // Page was opened with a signal - auto detect
+    mpLog('Link detected. Click Join to connect.', '#aa8');
+    mpLinkInput.value = location.href;
+    mpLinkInput.style.display = 'block';
+  }
+})();
+
+// Override placeAtMouse for sync
 placeAtMouse = function(mx, my) {
   const cx = Math.floor(mx), cy = Math.floor(my);
   if (selectedElement === 'switch') {
     const cell = getCell(cx, cy);
-    if (cell && cell.type === 'switch') { cell.active = !cell.active; sendMP({ mx, my, element: selectedElement }); return; }
+    if (cell && cell.type === 'switch') { cell.active = !cell.active; sendMP({ type: 'place', mx, my, element: selectedElement }); return; }
   }
   spawnBrushAt(mx, my, selectedElement);
-  sendMP({ mx, my, element: selectedElement });
+  sendMP({ type: 'place', mx, my, element: selectedElement });
 };
 
 // Pause controls
