@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sandbox</title>
-<script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.1/simplepeer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.3.2/dist/peerjs.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -2043,15 +2043,12 @@ function gameLoop(timestamp) {
   requestAnimationFrame(gameLoop);
 }
 
-// ----- Multiplayer (WebRTC via simple-peer, no server needed) -----
-let mpPeer = null;
-let mpConn = null;
-let mpRole = null; // 'host' or 'join'
+// ----- Multiplayer (PeerJS using WebSocket, no CORS) -----
+let peer = null;
+let conn = null;
+let peerId = null;
+let isHost = false;
 const mpStatus = document.getElementById('mp-status');
-const mpSignal = document.getElementById('mp-signal');
-const mpSignalOut = document.getElementById('mp-signal-out');
-const mpSignalIn = document.getElementById('mp-signal-in');
-const mpSignalBtn = document.getElementById('mp-signal-btn');
 
 function getGridData() {
   const data = [];
@@ -2084,83 +2081,71 @@ function loadGridData(data) {
   }
 }
 
-function sendMP(msg) {
-  if (mpConn && mpConn.connected) {
-    try { mpConn.send(JSON.stringify(msg)); } catch(e) {}
-  }
-}
-
-function onMPData(raw) {
-  try {
-    const msg = JSON.parse(raw);
-    if (msg.type === 'sync') { loadGridData(msg.data); return; }
-    if (msg.type === 'place') { spawnBrushAt(msg.mx, msg.my, msg.element); }
-  } catch(e) {}
-}
-
-function makeMP(isInitiator, signalData) {
-  if (mpPeer) { try { mpPeer.destroy(); } catch(e) {} }
-  mpPeer = new SimplePeer({
-    initiator: isInitiator,
-    trickle: false,
-    config: {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun.voipbuster.com:3478' },
-      ]
-    }
-  });
-  mpPeer.on('signal', (data) => {
-    mpSignalOut.value = JSON.stringify(data);
-    mpSignalOut.select();
-    try { navigator.clipboard.writeText(mpSignalOut.value); } catch(e) {}
-    mpSignal.style.display = 'block';
-    mpStatus.textContent = isInitiator ? 'Send this code to friend' : 'Send this answer to host';
-  });
-  mpPeer.on('connect', () => {
-    mpConn = mpPeer;
-    mpSignal.style.display = 'none';
-    mpStatus.textContent = 'Connected!';
-    mpStatus.style.color = '#4f4';
-    if (mpRole === 'host') sendMP({ type: 'sync', data: getGridData() });
-  });
-  mpPeer.on('data', onMPData);
-  mpPeer.on('error', (err) => { mpStatus.textContent = 'Error: ' + (err.message || err.code || 'unknown'); mpStatus.style.color = '#f44'; console.error(err); });
-  mpPeer.on('close', () => { mpStatus.textContent = 'Disconnected'; mpStatus.style.color = '#644'; mpConn = null; });
-  if (signalData) mpPeer.signal(signalData);
-  return mpPeer;
-}
-
 document.getElementById('host-btn').addEventListener('click', () => {
-  mpRole = 'host';
-  mpStatus.textContent = 'Generating signal...';
+  if (peer) { peer.destroy(); peer = null; }
+  mpStatus.textContent = 'Connecting...';
   mpStatus.style.color = '#aa8';
-  makeMP(true, null);
+  isHost = true;
+  peer = new Peer({ key: 'peerjs', debug: 0 });
+  peer.on('open', (id) => {
+    peerId = id;
+    mpStatus.textContent = 'Your code: ' + id;
+    mpStatus.style.color = '#4f4';
+    document.getElementById('mp-signal-out').value = id;
+    document.getElementById('mp-signal-out').style.display = 'block';
+    try { navigator.clipboard.writeText(id); } catch(e) {}
+  });
+  peer.on('connection', (c) => {
+    conn = c;
+    mpStatus.textContent = 'Friend joined!';
+    conn.on('open', () => {
+      mpStatus.textContent = 'Connected!';
+      mpStatus.style.color = '#4f4';
+      document.getElementById('mp-signal-out').style.display = 'none';
+      conn.send(JSON.stringify({ type: 'sync', data: getGridData() }));
+      document.getElementById('mp-signal-out').value = '';
+    });
+    conn.on('data', (raw) => {
+      try {
+        const msg = JSON.parse(raw);
+        if (msg.type === 'place') { spawnBrushAt(msg.mx, msg.my, msg.element); }
+      } catch(e) {}
+    });
+    conn.on('close', () => { mpStatus.textContent = 'Disconnected'; mpStatus.style.color = '#644'; conn = null; });
+  });
+  peer.on('error', (err) => {
+    mpStatus.textContent = 'Error: ' + err.message;
+    mpStatus.style.color = '#f44';
+    console.error(err);
+  });
+  peer.on('disconnected', () => { mpStatus.textContent = 'Disconnected from server'; mpStatus.style.color = '#644'; });
 });
 
 document.getElementById('join-btn').addEventListener('click', () => {
-  const raw = prompt('Paste the signal code from host:');
-  if (!raw) return;
-  try {
-    const signalData = JSON.parse(raw);
-    mpRole = 'join';
-    mpStatus.textContent = 'Connecting...';
-    mpStatus.style.color = '#aa8';
-    makeMP(false, signalData);
-  } catch(e) { mpStatus.textContent = 'Invalid code'; mpStatus.style.color = '#f44'; }
-});
-
-mpSignalBtn.addEventListener('click', () => {
-  const raw = mpSignalIn.value.trim();
-  if (!raw) return;
-  try {
-    const signalData = JSON.parse(raw);
-    if (mpPeer) mpPeer.signal(signalData);
-    mpSignalIn.value = '';
-    mpStatus.textContent = 'Signal sent!';
-  } catch(e) { mpStatus.textContent = 'Invalid signal'; }
+  const id = prompt('Enter host code:');
+  if (!id || !id.trim()) return;
+  isHost = false;
+  if (peer) { peer.destroy(); peer = null; }
+  mpStatus.textContent = 'Connecting...';
+  mpStatus.style.color = '#aa8';
+  peer = new Peer({ key: 'peerjs', debug: 0 });
+  peer.on('open', () => {
+    conn = peer.connect(id.trim());
+    conn.on('open', () => {
+      mpStatus.textContent = 'Connected!';
+      mpStatus.style.color = '#4f4';
+    });
+    conn.on('data', (raw) => {
+      try {
+        const msg = JSON.parse(raw);
+        if (msg.type === 'sync') { loadGridData(msg.data); return; }
+        if (msg.type === 'place') { spawnBrushAt(msg.mx, msg.my, msg.element); }
+      } catch(e) {}
+    });
+    conn.on('close', () => { mpStatus.textContent = 'Disconnected'; mpStatus.style.color = '#644'; conn = null; });
+    conn.on('error', (err) => { mpStatus.textContent = 'Conn error: ' + err; });
+  });
+  peer.on('error', (err) => { mpStatus.textContent = 'Error: ' + err.message; mpStatus.style.color = '#f44'; console.error(err); });
 });
 
 // Intercept placeAtMouse to sync
@@ -2168,11 +2153,17 @@ placeAtMouse = function(mx, my) {
   const cx = Math.floor(mx), cy = Math.floor(my);
   if (selectedElement === 'switch') {
     const cell = getCell(cx, cy);
-    if (cell && cell.type === 'switch') { cell.active = !cell.active; sendMP({ type: 'place', mx, my, element: selectedElement }); return; }
+    if (cell && cell.type === 'switch') { cell.active = !cell.active; sendMP({ mx, my, element: selectedElement }); return; }
   }
   spawnBrushAt(mx, my, selectedElement);
-  sendMP({ type: 'place', mx, my, element: selectedElement });
+  sendMP({ mx, my, element: selectedElement });
 };
+
+function sendMP(msg) {
+  if (conn && conn.open) {
+    try { conn.send(JSON.stringify({ type: 'place', ...msg })); } catch(e) {}
+  }
+}
 
 // Pause controls
 document.getElementById('pause-btn').addEventListener('click', () => {
