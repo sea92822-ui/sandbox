@@ -2188,7 +2188,7 @@ function createPC(isInitiator, remoteSignal) {
       mpLinkInput.value = url;
       mpLinkInput.style.display = 'block';
       mpCopyBtn.style.display = 'block';
-      try { navigator.clipboard.writeText(url); } catch(e) {}
+      navigator.clipboard.writeText(url).catch(function(){});
     } else {
       var url = location.origin + location.pathname + '#a=' + compressed;
       location.hash = 'a=' + compressed;
@@ -2196,7 +2196,7 @@ function createPC(isInitiator, remoteSignal) {
       mpLinkInput.value = url;
       mpLinkInput.style.display = 'block';
       mpCopyBtn.style.display = 'block';
-      try { navigator.clipboard.writeText(url); } catch(e) {}
+      navigator.clipboard.writeText(url).catch(function(){});
     }
     // If remote signal was already received, process it
     if (remoteSignal && !remoteReceived) {
@@ -2392,7 +2392,7 @@ mpConnectBtn.addEventListener('click', function() {
 
 mpCopyBtn.addEventListener('click', function() {
   var val = mpLinkInput.value;
-  if (val) { navigator.clipboard.writeText(val); mpLog('Copied!', '#8cf'); }
+  if (val) { navigator.clipboard.writeText(val).catch(function(){}); mpLog('Copied!', '#8cf'); }
 });
 
 // Auto-detect on load
